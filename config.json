@@ -1,0 +1,31 @@
+{
+  "_meta": {
+    "version": "1.0",
+    "created_at": "",
+    "modified_at": "2026-06-04T08:32:34.705095"
+  },
+  "password_hash": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+  "vision_trig_ip": "127.0.0.1",
+  "vision_trig_port": 8081,
+  "vision_id_ip": "127.0.0.1",
+  "vision_id_port": 8080,
+  "cobot_ip": "127.0.0.1",
+  "cobot_port": 9000,
+  "trigger_server_ip": "0.0.0.0",
+  "trigger_server_port": 5000,
+  "program_mapping_file": "program_mapping.xlsx",
+  "results_report_file": "results_report.xlsx",
+  "vision_test_count": 3,
+  "result_images_folder": "C:/Users/Automation_Meeserv/Desktop/FRESH/code/result_images",
+  "result_images_backup_folders": [
+    "C:/Users/Automation_Meeserv/Desktop/FRESH/code/result_images"
+  ],
+  "scan_mode": "camera",
+  "camera_index": 0,
+  "watchdog_interval": 2.0,
+  "reconnect_check_interval": 3.0,
+  "reconnect_retry_delay": 5.0,
+  "debug_monitor_interval": 2.0,
+  "tcp_buffer_size": 4096,
+  "live_camera_index": 1
+}
