@@ -19,6 +19,12 @@ from openpyxl.styles import Font
 import scanner as sc
 import excel as ex
 from thread_logger import LoggedThread, get_logger as _get_thread_logger
+import camera_barcode
+import camera_hub
+from pathlib import Path
+from typing import Callable, Optional
+
+import cv2
 
 
 def _to_bytes(message, is_hex=False):
@@ -651,6 +657,8 @@ class App():
         return "pass"
 
     def start(self):
+        camera_hub.start()
+        frame = camera_hub.get_frame() 
         return True
 
     def run(self):
@@ -658,78 +666,216 @@ class App():
         return self.start()
 
     def stop(self):
-        """
-        إيقاف البرنامج بشكل نضيف — non-blocking للـ GUI thread.
+        pass
 
-        الـ stop بيتم في ثريد خلفي عشان الـ GUI ما تتجمدش:
-        1. نشير للـ threads إنها توقف (_stop_app)
-        2. ننتظر السيكوانس تخلص (في الخلفية) عشان الكوبوت ياخد النتيجة الصح
-        3. نقفل الـ connections بعد ما كل حاجة تخلص
-        """
-        log = _get_thread_logger()
-        with self._start_stop_lock:
-            if not self.is_running:
-                log.warning("App.stop() called but not running")
-                return
-            log.info("App: STOPPING...")
-            self._stop_app.set()
-            self.is_running = False   # نحجب start() جديدة فوراً
-            self._set_stage(AppStage.IDLE, current_step=0,
-                            current_barcode=None, current_program=None)
 
-        # ── الإغلاق الحقيقي في ثريد خلفي عشان GUI ما تتجمدش ──────────────
-        def _shutdown_worker():
-            # انتظر السيكوانس الحالية تخلص (max 120s) قبل ما نقفل الـ connections
-            seq_thread = getattr(self, "_sequance_worker_thread", None)
-            if seq_thread is not None and seq_thread.is_alive():
-                log.info("App: waiting for current sequence to finish (max 120s)...")
-                seq_thread.join(timeout=120)
-                if seq_thread.is_alive():
-                    log.warning("App: sequence timeout — forcing disconnect now")
-                else:
-                    log.info("App: sequence finished cleanly")
+# Working App implementation used by the FastAPI WebSocket integration.
+# It intentionally keeps the same class name so old imports receive this version.
+class App():
+    def __init__(self):
+        self.robot = None
+        self.robot_ip = None
+        self._robot_lock = threading.RLock()
+        self._motion_lock = threading.Lock()
+        self._last_images = []
 
-            # نوقف مصدر الباركود
-            from config import config as _cfg_stop
-            if _cfg_stop.get("scan_mode", "manual") == "camera":
-                try:
-                    import camera_barcode
-                    camera_barcode.stop()
-                    log.info("Camera barcode scanner stopped")
-                except Exception as e:
-                    log.warning(f"camera_barcode.stop failed: {e}")
-            # ── وقف الكاميرا المباشرة ─────────────────────────────────────
+    def check_images_status(self, images_data):
+        for image_name, value in images_data.items():
+            if str(value).strip().lower() == "yes":
+                return "fail"
+        return "pass"
+
+    def start(self, camera_index=None):
+        camera_hub.start(camera_index=camera_index)
+        camera_hub.wait_for_frame(timeout=5.0)
+        return True
+
+    def run(self):
+        return self.start()
+
+    def stop(self):
+        self.disconnect_robot()
+        camera_hub.stop()
+
+    def _get_robot_class(self):
+        try:
+            from fairino.Robot import RPC
+        except Exception as exc:
+            raise RuntimeError(f"Fairino SDK import failed: {exc}") from exc
+        return RPC
+
+    def connect_robot(self, ip=None, enable=True):
+        from config import config as _cfg
+
+        robot_ip = ip or _cfg.get("cobot_ip", "192.168.57.2")
+        with self._robot_lock:
+            if self.robot is not None and self.robot_ip == robot_ip:
+                return {"connected": True, "ip": self.robot_ip, "reused": True}
+
+            RPC = self._get_robot_class()
+            self.robot = RPC(robot_ip)
+            self.robot_ip = robot_ip
+
+            if enable:
+                enable_error = self.robot.RobotEnable(1)
+                if enable_error not in (0, None):
+                    raise RuntimeError(f"RobotEnable failed with error code {enable_error}")
+
+        return {"connected": True, "ip": robot_ip, "reused": False}
+
+    def disconnect_robot(self):
+        with self._robot_lock:
+            if self.robot is None:
+                return {"connected": False}
+
             try:
-                import live_image
-                live_image.stop()
-                log.info("live_image: stopped")
-            except Exception as e:
-                log.warning(f"live_image.stop failed: {e}")
+                self.robot.CloseRPC()
+            finally:
+                self.robot = None
+                self.robot_ip = None
 
-            try:
-                sc.stop_listener()
-                log.info("Scanner listener stopped")
-            except Exception as e:
-                log.warning(f"scanner.stop_listener failed: {e}")
+        return {"connected": False}
 
-            for client in (self.VisionClient_TRIG, self.VisionClient_ID, self.cobotClient):
-                try:
-                    client.disconnect()
-                except Exception as e:
-                    log.warning(f"client.disconnect failed: {e}")
-            try:
-                self.triggerserver.stop()
-            except Exception as e:
-                log.warning(f"server.stop failed: {e}")
+    def ensure_robot(self):
+        with self._robot_lock:
+            if self.robot is None:
+                self.connect_robot()
+            return self.robot
 
-            # ── camera_hub: آخر حاجة تتوقف (بعد camera_barcode و live_image) ──
-            try:
-                import camera_hub
-                camera_hub.stop()
-                log.info("camera_hub: stopped")
-            except Exception as e:
-                log.warning(f"camera_hub.stop failed: {e}")
+    def robot_status(self):
+        with self._robot_lock:
+            if self.robot is None:
+                return {"connected": False, "ip": None}
+            return {"connected": True, "ip": self.robot_ip}
 
-            log.info("App: STOPPED")
+    def move_to_point(self, point, motion_type="linear", tool=0, user=0, vel=20.0, acc=0.0, ovl=100.0):
+        robot = self.ensure_robot()
+        point_name = point.get("name") or point.get("id") or "point"
+        selected_motion = str(point.get("motion_type", motion_type)).lower()
 
-        LoggedThread(target=_shutdown_worker, name="App-shutdown", daemon=True).start()
+        if selected_motion in ("joint", "j", "movej"):
+            joint_pos = self._read_position(point, ("joint_pos", "joints", "position"))
+            desc_pos = point.get("desc_pos", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            error = robot.MoveJ(
+                joint_pos=joint_pos,
+                tool=point.get("tool", tool),
+                user=point.get("user", user),
+                desc_pos=desc_pos,
+                vel=point.get("vel", vel),
+                acc=point.get("acc", acc),
+                ovl=point.get("ovl", ovl),
+                blendT=point.get("blendT", -1.0),
+            )
+        else:
+            desc_pos = self._read_position(point, ("desc_pos", "pose", "position"))
+            error = robot.MoveL(
+                desc_pos=desc_pos,
+                tool=point.get("tool", tool),
+                user=point.get("user", user),
+                joint_pos=point.get("joint_pos", [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+                vel=point.get("vel", vel),
+                acc=point.get("acc", acc),
+                ovl=point.get("ovl", ovl),
+                blendR=point.get("blendR", -1.0),
+            )
+
+        if error not in (0, None):
+            raise RuntimeError(f"Move to {point_name} failed with error code {error}")
+
+        return {"point": point_name, "motion_type": selected_motion, "error": error or 0}
+
+    def capture_image(self, point_name="point", index=1, output_dir=None):
+        from config import config as _cfg
+
+        if not camera_hub.is_running():
+            self.start()
+
+        if not camera_hub.wait_for_frame(timeout=5.0):
+            raise RuntimeError("Camera did not provide a frame")
+
+        frame = camera_hub.get_frame()
+        if frame is None:
+            raise RuntimeError("Camera frame is empty")
+
+        folder = Path(output_dir or _cfg.get("result_images_folder", "result_images"))
+        folder.mkdir(parents=True, exist_ok=True)
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(point_name)).strip("_") or "point"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        image_path = folder / f"{safe_name}_{index}_{timestamp}.png"
+
+        if not cv2.imwrite(str(image_path), frame):
+            raise RuntimeError(f"Failed to save image to {image_path}")
+
+        image_info = {
+            "point": point_name,
+            "index": index,
+            "image_path": str(image_path.resolve()),
+        }
+        self._last_images.append(image_info)
+        return image_info
+
+    def move_points_and_capture(
+        self,
+        points,
+        motion_type="linear",
+        tool=0,
+        user=0,
+        vel=20.0,
+        acc=0.0,
+        ovl=100.0,
+        output_dir=None,
+        progress_callback: Optional[Callable[[dict], None]] = None,
+    ):
+        if not isinstance(points, list) or not points:
+            raise ValueError("points must be a non-empty list")
+
+        results = []
+        with self._motion_lock:
+            self.start()
+            self.ensure_robot()
+
+            for index, point in enumerate(points, start=1):
+                point_name = point.get("name") or point.get("id") or f"point_{index}"
+                self._emit_progress(progress_callback, "moving", point=point_name, index=index, total=len(points))
+                move_result = self.move_to_point(
+                    point,
+                    motion_type=motion_type,
+                    tool=tool,
+                    user=user,
+                    vel=vel,
+                    acc=acc,
+                    ovl=ovl,
+                )
+                self._emit_progress(progress_callback, "arrived", point=point_name, index=index, total=len(points))
+                image_info = self.capture_image(point_name=point_name, index=index, output_dir=output_dir)
+                item = {**move_result, **image_info}
+                results.append(item)
+                self._emit_progress(progress_callback, "captured", **item, total=len(points))
+
+        self._emit_progress(progress_callback, "completed", count=len(results), images=results)
+        return results
+
+    def stop_robot_motion(self):
+        with self._robot_lock:
+            if self.robot is None:
+                return {"stopped": False, "reason": "robot is not connected"}
+            error = self.robot.StopMove()
+        if error not in (0, None):
+            raise RuntimeError(f"StopMove failed with error code {error}")
+        return {"stopped": True, "error": error or 0}
+
+    def _read_position(self, point, keys):
+        for key in keys:
+            if key in point:
+                position = point[key]
+                break
+        else:
+            raise ValueError(f"Point is missing one of these fields: {', '.join(keys)}")
+
+        if not isinstance(position, (list, tuple)) or len(position) != 6:
+            raise ValueError("Point position must be a list of 6 numbers")
+        return [float(value) for value in position]
+
+    def _emit_progress(self, callback, event, **payload):
+        if callback:
+            callback({"event": event, **payload, "timestamp": datetime.now().isoformat()})

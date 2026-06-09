@@ -1,0 +1,11 @@
+google-genai
+python-dotenv
+opencv-python
+openpyxl
+Pillow
+pandas
+zxing-cpp
+fastapi
+uvicorn[standard]
+keyboard
+pyserial

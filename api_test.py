@@ -1,11 +1,12 @@
 import os
 from google import genai
 from google.genai import types
-from PIL import Image
+import cv2
 from dotenv import load_dotenv
 
 load_dotenv()
 API = os.getenv("GENAI_API_KEY") # تأكد إنك حطيت الـ API Key في ملف .env بالاسم ده
+api_model = os.getenv("GENAI_MODEL") # أو أي موديل تاني متاح عندك
 # إعداد العميل
 client = genai.Client(api_key=API)
 
@@ -19,10 +20,11 @@ def check_multiple_images_for_water(image_paths: list[str]) -> str:
         
         for i, path in enumerate(image_paths, start=1):
             if os.path.exists(path):
-                img = Image.open(path)
+                img = cv2.imread(path)
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 # بنضيف الصورة والتعريف بتاعها للموديل
                 contents.append(f"This is Image {i}:")
-                contents.append(img)
+                contents.append(rgb_img)
             else:
                 print(f"Warning: Image {path} not found.")
 
@@ -51,7 +53,7 @@ def check_multiple_images_for_water(image_paths: list[str]) -> str:
 
         # 3. إرسال الطلب
         response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model= api_model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction="You are a precise quality control assistant. Analyze the images and output JSON strictly mapping each image number to 'Yes' or 'No'.",
