@@ -19,10 +19,11 @@ from openpyxl.styles import Font
 import scanner as sc
 import excel as ex
 from thread_logger import LoggedThread, get_logger as _get_thread_logger
-import camera_barcode
+import camera_barcode as cb
 import camera_hub
 from pathlib import Path
 from typing import Callable, Optional
+from fairino import Robot
 
 import cv2
 
@@ -654,7 +655,7 @@ class App():
                 return "fail"
                 
         # إذا انتهت الحلقة بدون العثور على 'yes'، يتم إرجاع 'pass'
-        return "pass"
+        return "pass" 
 
     def start(self):
         camera_hub.start()
@@ -674,7 +675,7 @@ class App():
 class App():
     def __init__(self):
         self.robot = None
-        self.robot_ip = None
+        self.robot_ip = "192.168.57.2"
         self._robot_lock = threading.RLock()
         self._motion_lock = threading.Lock()
         self._last_images = []
@@ -685,16 +686,105 @@ class App():
                 return "fail"
         return "pass"
 
+    def get_barcode_from_scanner(self):
+            """
+            ياخد الباركود من scanner.queue_barcode (اللي بيتعمل put فيه من thread الـ keyboard hook)
+            ويحطه في vision_queue + report_queue.
+
+            ملحوظة: شيلنا الـ flag و race condition عليه — الكيو نفسه thread-safe.
+            """
+            log = _get_thread_logger()
+            while not self._stop_app.is_set():
+                try:
+                    # هينتظر لحد ما يجي باركود أو نص ثانية (عشان نقدر نتحقق من _stop_app)
+                    barcode = sc.queue_barcode.get(timeout=0.5)
+                except queue.Empty:
+                    log.info(f"Barcode not received within timeout period")
+                    continue
+
+                try:
+                    self.vision_queue.put(barcode)
+                    log.info(f"Barcode received and put in vision_queue: {barcode}")
+                finally:
+                    sc.queue_barcode.task_done()
+
+
+    def determine_program_from_barcode(self, barcode, excel_file_path=None):
+        # نقرأ الـ default من config لو ماتمررش
+        if excel_file_path is None:
+            from config import config as _cfg
+            excel_file_path = _cfg.get("program_mapping_file", "program_mapping.xlsx")
+
+        # LOGIC-1 FIX: تحقق من طول الباركود قبل الوصول لـ [-3]
+        if not barcode or len(barcode) < 3:
+            return "خطأ: الباركود قصير جداً"
+
+        target_char = barcode[-3]
+
+        try:
+            # PERF-1 FIX: نقرأ الملف بس لو اتغير (cache by mtime)
+            import os as _os
+            try:
+                current_mtime = _os.path.getmtime(excel_file_path)
+            except OSError:
+                current_mtime = 0.0
+
+            if (self._mapping_cache_df is None
+                    or self._mapping_cache_path != excel_file_path
+                    or self._mapping_cache_mtime != current_mtime):
+                self.cobotClient._log_add("INFO", f"Loading mapping file: {excel_file_path}")
+                self._mapping_cache_df    = pd.read_excel(excel_file_path)
+                self._mapping_cache_path  = excel_file_path
+                self._mapping_cache_mtime = current_mtime
+            else:
+                self.cobotClient._log_add("INFO", "Using cached mapping (file unchanged)")
+
+            df = self._mapping_cache_df
+            char_column  = df.columns[0]
+            value_column = df.columns[1]
+
+            # 2. البحث المباشر بدون loops
+            match = df[df[char_column] == target_char]
+
+            if not match.empty:
+                # جلب القيمة المقابلة للحرف
+                excel_value = match[value_column].values[0]
+                return excel_value
+            else:
+                return "الحرف غير موجود في ملف الإكسل."
+
+        except FileNotFoundError:
+            self.cobotClient._log_add("INFO", f"Excel file not found at path: {excel_file_path}")
+            return "خطأ: ملف الإكسل غير موجود في المسار المحدد."
+        except Exception as e:
+            self.cobotClient._log_add("INFO", f"Unexpected error occurred with pandas: {e}")
+            return f"حدث خطأ غير متوقع: {e}"
+    
     def start(self, camera_index=None):
+        self._stop_app = threading.Event()
         camera_hub.start(camera_index=camera_index)
         camera_hub.wait_for_frame(timeout=5.0)
-        return True
+        self.ensure_robot()
+        cb.start()  
+        self.robot.SetRobotMode(1)  # وضع التشغيل العادي
+        self.robot.SetDO(0, 1)  # تفعيل مخرج رقمي
+        while self.robot.connect_to_robot():
+                DI0= self.robot.GetDI(0, 0)  # قراءة حالة مدخل رقمي للتأكد من الاتصال    
+                if DI0==1:
+                    self.robot.SetDO(3, 1)  # تفعيل مخرج رقمي
+                    self.robot.SetDO(0, 0)  # تفعيل مخرج رقمي
+
+                    print("Robot DI0 is HIGH - Connection seems good.")
+                else:             
+                    print("Robot DI0 is LOW - Check robot connection or configuration.")
 
     def run(self):
         return self.start()
 
     def stop(self):
         self.disconnect_robot()
+        cb.stop()
+        self._stop_app.set()
         camera_hub.stop()
 
     def _get_robot_class(self):

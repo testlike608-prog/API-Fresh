@@ -15,7 +15,7 @@ def shutdown_app():
     robot_app.stop()
 
 
-@app.websocket("/ws")
+@app.websocket("/ws/robot")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     await _send(websocket, "connected", message="WebSocket API is ready")

@@ -1,0 +1,1 @@
+from fairino import Robot
